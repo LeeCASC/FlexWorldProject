@@ -21,14 +21,42 @@ class Dust3rWrapper:
     def __init__(self, opts, load_mast3r=False, device='cuda'):
         self.opts = opts
         self.device = device
+        self.backend = getattr(self.opts, 'backend', None) or ('mast3r' if load_mast3r else 'dust3r')
+
+        # DUSt3R model (dense pointmap + global alignment)
         self.dust3r = load_model(self.opts.model_path, self.device)
-        if load_mast3r:
+
+        # MASt3R model (sparse global alignment) - only load when requested
+        self.mast3r = None
+        if self.backend == 'mast3r' or load_mast3r:
             from mast3r.model import AsymmetricMASt3R
-            self.mast3r = AsymmetricMASt3R.from_pretrained('./tools/dust3r/checkpoint/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth').to(self.device)
+            mast3r_path = getattr(
+                self.opts,
+                'mast3r_model_path',
+                './tools/dust3r/checkpoint/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth'
+            )
+            self.mast3r = AsymmetricMASt3R.from_pretrained(mast3r_path).to(self.device)
 
     def run_dust3r_init(self, input_images = None, clean_pc = True, bg_mask=None): # setup self.scene
         if input_images is None:
             input_images = self.images
+
+        # MASt3R backend: keep the same API but swap the reconstruction engine
+        if getattr(self, 'backend', 'dust3r') == 'mast3r':
+            scene = self.run_mast3r(input_images, clean_pc=clean_pc)
+            self.scene = scene
+            # provide a depth-like tensor for downstream heuristics (e.g., camera trajectory magnitude)
+            if getattr(scene, 'depthmaps_dense', None) is not None and len(scene.depthmaps_dense) > 0:
+                d = scene.depthmaps_dense[-1]
+                if isinstance(d, torch.Tensor) and d.ndim == 1 and getattr(self, 'images', None):
+                    H, W = self.images[-1]['img'].shape[2:]
+                    if d.numel() == H * W:
+                        d = d.view(H, W)
+                self.depth = d.detach()
+            elif getattr(scene, 'pts', None) is not None and len(scene.pts) > 0:
+                # fallback: use point Z as a proxy
+                self.depth = scene.pts[-1][..., 2].detach()
+            return self.scene
             
         pairs = make_pairs(input_images, scene_graph='complete', prefilter=None, symmetrize=True)
         output = inference(pairs, self.dust3r, self.device, batch_size=self.opts.batch_size)
@@ -118,20 +146,25 @@ class Dust3rWrapper:
         filelist = [img['instance'] for img in input_images]
         with tempfile.TemporaryDirectory() as tmpdirname:
             cache_dir = tmpdirname
+            if self.mast3r is None:
+                raise RuntimeError("MASt3R backend requested but self.mast3r is not loaded. "
+                                   "Set opt.dust3r.backend=mast3r (and provide mast3r_model_path if needed).")
             model = self.mast3r
-            lr1=0.01
-            niter1=500
-            lr2=0.005
-            niter2=200
-            optim_level = "refine+depth"
-            shared_intrinsics=True
-            matching_conf_thr=5.
+            lr1 = float(getattr(self.opts, 'mast3r_lr1', 0.01))
+            niter1 = int(getattr(self.opts, 'mast3r_niter1', 500))
+            lr2 = float(getattr(self.opts, 'mast3r_lr2', 0.005))
+            niter2 = int(getattr(self.opts, 'mast3r_niter2', 200))
+            optim_level = str(getattr(self.opts, 'mast3r_optim_level', "refine+depth"))
+            shared_intrinsics = bool(getattr(self.opts, 'mast3r_shared_intrinsics', True))
+            matching_conf_thr = float(getattr(self.opts, 'mast3r_matching_conf_thr', 5.0))
             scene = sparse_global_alignment(filelist, pairs, cache_dir,
                                         model, lr1=lr1, niter1=niter1, lr2=lr2, niter2=niter2, device=self.device,
                                         opt_depth='depth' in optim_level, shared_intrinsics=shared_intrinsics,
                                         matching_conf_thr=matching_conf_thr)
-            # use scene.get_pts3d() here to eliminate cache
-            scene.pts = [i.detach() for i in scene.get_pts3d()] 
+            # eliminate cache dependency: precompute dense points (+ depthmaps) inside tmpdir
+            pts3d, depthmaps, _confs = scene.get_dense_pts3d(clean_depth=False)
+            scene.pts = [p.detach() for p in pts3d]
+            scene.depthmaps_dense = [d.detach() for d in depthmaps]
             # if cam_trajs is not None:
             #     scene.preset_pose([cam.getC2W_RDF() for cam in cam_trajs])
             #     scene.preset_focal([cam.f for cam in cam_trajs])
@@ -148,7 +181,10 @@ class Dust3rWrapper:
             scene._set_depthmap(i, scaled_depth, force=True)
     
     def get_inital_pm(self):  # self.scene should have been setup
-        pts = self.get_pm(self.scene, self.images)
+        if getattr(self, 'backend', 'dust3r') == 'mast3r':
+            pts = self.get_pm_mast3r(self.scene, self.images)
+        else:
+            pts = self.get_pm(self.scene, self.images)
         self.pts = pts
         return pts
 
@@ -194,15 +230,13 @@ class Dust3rWrapper:
         cam_c2ws = scene.get_im_poses().detach()
         fs = scene.get_focals().detach()
         pps = scene.get_principal_points()
-        print(pps[0])
-        print(type(fs))
-        print(fs.shape)
-        # erase dependency on self.images
-        # shape = scene.get_depthmaps()[0].shape
-        # print(shape)
-        #shape = self.images[0]['true_shape']
-        #H, W = int(shape[0]), int(shape[1])
-        H, W = 288, 512
+        # Prefer the actual processed image size if available
+        if getattr(self, 'images', None) is not None and len(self.images) > 0:
+            H, W = self.images[0]["img"].shape[2:]
+            H, W = int(H), int(W)
+        else:
+            shape = scene.get_depthmaps()[0].shape
+            H, W = int(shape[0]), int(shape[1])
         #cams = [Mcam().set_cam(W=W, H=H, c=tuple(pp), f=float(ff), R=cam[:3, :3], T=cam[:3, 3]) for cam,ff,pp in zip(cam_c2ws,fs,pps)]
         cams = [Mcam().set_cam(W=W, H=H, c=(pp[0].item(), pp[1].item()), f=ff.item(), R=cam[:3, :3], T=cam[:3, 3]) for cam,ff,pp in zip(cam_c2ws,fs,pps)]
         for cam in cams:
@@ -214,6 +248,9 @@ class Dust3rWrapper:
     
     
     def get_cams(self, scene=None):
+        if getattr(self, 'backend', 'dust3r') == 'mast3r':
+            return self.get_cams_mast3r(scene=scene)
+
         if scene is None:
             if getattr(self, 'scene', None) is None:
                 raise ValueError("self.scene is not setup, pass a scene mannually")
@@ -284,6 +321,9 @@ class Dust3rWrapper:
         if len(images) == 1:
             images = [images[0], copy.deepcopy(images[0])]
             images[1]['idx'] = 1
+            # IMPORTANT: 'instance' is used as a stable identifier (e.g., MASt3R caching / pair naming).
+            # Make sure the duplicated image has a different instance id.
+            images[1]['instance'] = str(images[1]['idx'])
             
         return images, img_ori
 

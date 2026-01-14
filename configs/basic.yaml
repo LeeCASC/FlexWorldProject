@@ -5,6 +5,10 @@ size: [1024,576] # [W, H]
 sr: True
 
 dust3r:
+  # backend for 3D reconstruction
+  # - dust3r: DUSt3R dense pointmap + global alignment (default, faster)
+  # - mast3r: MASt3R sparse global alignment (often better geometry; slower)
+  backend: dust3r
   size: 512
   square_ok: True
   force_1024: False
@@ -16,6 +20,16 @@ dust3r:
   bg_trd: 0.2
   min_conf_thr: 3.0
   dpt_trd: 1
+
+  # MASt3R settings (only used when backend=mast3r)
+  mast3r_model_path: ./tools/dust3r/checkpoint/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth
+  mast3r_optim_level: refine+depth
+  mast3r_shared_intrinsics: true
+  mast3r_matching_conf_thr: 5.0
+  mast3r_lr1: 0.01
+  mast3r_niter1: 500
+  mast3r_lr2: 0.005
+  mast3r_niter2: 200
 
 vlm:
   llava:
